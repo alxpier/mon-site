@@ -442,7 +442,61 @@ JSON : {"results":[{"keyword":"...","category":"...","sebCategory":"..."},...]}`
   // ─── RENDER ────────────────────────────────────────────────────────────────
   const H2=({c})=><h2 style={{fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,fontSize:20,margin:"0 0 8px",color:"#fff"}}>{c}</h2>;
   const Sub=({c})=><p style={{fontSize:13,color:G.sub,marginBottom:20,lineHeight:1.6}}>{c}</p>;
+  const [passwordInput, setPasswordInput] = useState("");
+const [isAllowed, setIsAllowed] = useState(false);
+const PASSWORD = "sqli2026";
 
+if (!isAllowed) {
+  return (
+    <div style={{
+      background: G.bg,
+      color: G.text,
+      minHeight: "100vh",
+      display: "flex",
+      flexDirection: "column",
+      justifyContent: "center",
+      alignItems: "center",
+      fontFamily: "'IBM Plex Mono','Courier New',monospace"
+    }}>
+      <h1>Accès protégé</h1>
+
+      <input
+        type="password"
+        placeholder="Mot de passe"
+        value={passwordInput}
+        onChange={(e) => setPasswordInput(e.target.value)}
+        style={{
+          background: G.faint,
+          border: `1px solid ${G.border}`,
+          color: G.text,
+          padding: "10px 14px",
+          borderRadius: 7,
+          marginBottom: 12
+        }}
+      />
+
+      <button
+        onClick={() => {
+          if (passwordInput === PASSWORD) {
+            setIsAllowed(true);
+          } else {
+            alert("Mot de passe incorrect");
+          }
+        }}
+        style={{
+          background: G.accent,
+          color: "#fff",
+          border: "none",
+          padding: "10px 22px",
+          borderRadius: 7,
+          cursor: "pointer"
+        }}
+      >
+        Entrer
+      </button>
+    </div>
+  );
+}
   return(
     <div style={{fontFamily:"'IBM Plex Mono','Courier New',monospace",background:G.bg,minHeight:"100vh",color:G.text}}>
       <style>{`@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;700&display=swap');*{box-sizing:border-box}input,textarea{font-family:'IBM Plex Mono',monospace}::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:#0e1117}::-webkit-scrollbar-thumb{background:#1e2a3d;border-radius:3px}button:hover:not(:disabled){filter:brightness(1.12)}@keyframes spin{to{transform:rotate(360deg)}}`}</style>
