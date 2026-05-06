@@ -11,7 +11,7 @@ async function callClaude(system, userText, images=[]) {
   const content=[];
   for(const img of images) content.push({type:"image",source:{type:"base64",media_type:img.type,data:img.data}});
   content.push({type:"text",text:userText});
-  const res=await fetch("https://api.anthropic.com/v1/messages",{
+  const res=await fetch("/api/claude",{
     method:"POST",
     headers:{"Content-Type":"application/json"},
     body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:8000,system,messages:[{role:"user",content}]}),
