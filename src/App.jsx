@@ -437,18 +437,32 @@ export default function App(){
     return pairs;
   }
 
+  // Dynamic volume threshold: filter keywords below 10% of the median volume
+  function computeVolumeThreshold(kws){
+    if(!kws.length)return 0;
+    const sorted=[...kws].map(k=>k.volume).sort((a,b)=>a-b);
+    const median=sorted[Math.floor(sorted.length/2)];
+    // threshold = max(10, 10% of median) — never kill everything
+    return Math.max(10, Math.round(median*0.1));
+  }
+
   function runRuleBasedCleaning(){
     const before=rawWithVol.length;
-    const cleaned=ruleBasedClean(rawWithVol);
+    // Step 1: rule-based brand/noise filter
+    let cleaned=ruleBasedClean(rawWithVol);
+    // Step 2: dynamic volume threshold
+    const threshold=computeVolumeThreshold(cleaned);
+    const beforeThreshold=cleaned.length;
+    cleaned=cleaned.filter(k=>k.volume>=threshold);
     setCleanedKws(cleaned);
-    setCleanStats({before,afterRules:cleaned.length});
-    addLog(`✅ Nettoyage règles : ${cleaned.length}/${before} conservés (${before-cleaned.length} supprimés)`);
+    setCleanStats({before,afterRules:cleaned.length,volumeThreshold:threshold,removedByThreshold:beforeThreshold-cleaned.length});
+    addLog(`✅ Règles : ${cleaned.length}/${before} conservés · seuil volume ≥ ${threshold} (${beforeThreshold-cleaned.length} faibles volumes écartés)`);
   }
 
   async function runSmartCleaning(){
     if(!cleanedKws.length)return;
     setLoading(true);setErr("");
-    const source=cleanedKws; // refine current list, not rawWithVol
+    const source=cleanedKws;
     const BATCH=80;
     const total=Math.ceil(source.length/BATCH);
     const kept=[];
@@ -456,53 +470,50 @@ export default function App(){
       for(let b=0;b<total;b++){
         setLoadMsg(`Nettoyage IA — batch ${b+1}/${total}…`);
         const batch=source.slice(b*BATCH,(b+1)*BATCH);
+        // Compact prompt to save tokens
         const resp=await callClaude(
-          `Tu es un expert SEO. Nettoie cette liste de mots-clés en une seule passe.
+          `Expert SEO. Pour cette liste de mots-clés (keyword|volume), SUPPRIMER :
+- Marques : Tefal Rowenta Krups Moulinex Calor SEB WMF Imusa Tramontina et concurrents locaux
+- Recettes/cuisine : receta recipe recette "cómo hacer" "comment faire" preparar cocinar
+- Promo/années : 2023 2024 "black friday" soldes oferta
+- Hors-périmètre : réseaux sociaux Wikipedia YouTube Amazon Walmart eBay
+- Trop générique sans intention produit
+- Quasi-doublons : garder UNIQUEMENT le plus grand volume
 
-SUPPRIMER obligatoirement :
-- Toutes les marques (Tefal, Rowenta, Krups, Moulinex, Calor, SEB, WMF, Imusa, Tramontina, et tous concurrents locaux)
-- Mots-clés recettes / cuisine (contenu, pas produit) : receta, recipe, recette, cómo hacer, comment faire, preparar…
-- Années (2023, 2024…), événements promo (Black Friday, soldes, oferta especial…)
-- Réseaux sociaux, Wikipedia, YouTube, Amazon, Walmart, eBay, noms de personnes
-- Mots trop génériques sans lien direct avec les catégories produits (ex: "cocina", "hogar" seuls)
-- Quasi-doublons : si deux mots-clés sont quasi-identiques (pluriel, accent, faute, ordre des mots), garder uniquement celui avec le PLUS GRAND volume
-
-GARDER ABSOLUMENT : tout mot-clé générique avec une intention produit claire (achat, comparaison, avis, entretien, utilisation, caractéristiques) — même à faible volume s'il est unique sémantiquement.
-
-Réponds UNIQUEMENT en JSON : {"kept":["kw1","kw2",...]}`,
-          `Marque:${config.brand}|Pays:${config.country}|Langue:${config.language}
-Catégories produits: ${categories.join(", ")}
-Mots-clés (keyword|volume):\n${batch.map(k=>`${k.keyword}|${k.volume}`).join("\n")}`
+GARDER : mots-clés génériques avec intention produit (achat avis comparaison entretien utilisation).
+JSON : {"kept":["kw1","kw2",...]}`,
+          `Marque:${config.brand}|Catégories:${categories.slice(0,8).join(",")}
+${batch.map(k=>`${k.keyword}|${k.volume}`).join("\n")}`
         );
         const parsed=parseJSON(resp);
         const keptSet=new Set((parsed.kept||[]).map(k=>k.toLowerCase().trim()));
         kept.push(...batch.filter(k=>keptSet.has(k.keyword.toLowerCase().trim())));
       }
-      // Local similarity detection cross-batches
       const pairs=detectSimilarPairs(kept);
       setCleanedKws(kept);
       setCleanStats(s=>({...s,afterSmart:kept.length,similarPairs:pairs}));
-      addLog(`✅ Nettoyage IA : ${kept.length} conservés (${source.length-kept.length} supprimés) · ${pairs.length} paires similaires cross-batches`);
+      addLog(`✅ Passe IA : ${kept.length} conservés (${source.length-kept.length} supprimés) · ${pairs.length} paires similaires cross-batches`);
     }catch(e){setErr("Erreur: "+e.message);}
     setLoading(false);
   }
   async function runCategorization(){
     setLoading(true);setErr("");
     const kws=cleanedKws.filter(k=>k.volume>0);
-    const BATCH=80;const allResults=[];const total=Math.ceil(kws.length/BATCH);
+    const BATCH=120;const allResults=[];const total=Math.ceil(kws.length/BATCH);
     const needsTranslation=!["fr","français","french","en","english","anglais"].some(l=>config.language.toLowerCase().includes(l));
     try{
       for(let b=0;b<total;b++){
         setLoadMsg(`Catégorisation batch ${b+1}/${total}…`);
         const batch=kws.slice(b*BATCH,(b+1)*BATCH);
         const resp=await callClaude(
-          `Expert SEO et produit Groupe SEB. Pour chaque mot-clé assigne :
-1. "category" : catégorie produit exacte parmi la liste fournie
-2. "sebCategory" : parmi ${SEB_CATS.join(", ")}
-${needsTranslation?'3. "translation" : traduction anglaise du mot-clé (courte, naturelle)':''}
-100% assignés, jamais Uncategorized, ne pas modifier le texte original.
-JSON : {"results":[{"keyword":"...","category":"...","sebCategory":"..."${needsTranslation?',"translation":"..."':''}},...]}`,
-          `Marque:${config.brand}|Pays:${config.country}|Langue:${config.language}\nCatégories:\n${categories.join("\n")}\nMots-clés:\n${batch.map(k=>`${k.keyword}|${k.volume}`).join("\n")}`
+          `SEO+SEB expert. Assigne à chaque mot-clé :
+1."category": UNE catégorie exacte de la liste
+2."sebCategory": UN parmi ${SEB_CATS.join("|")}
+${needsTranslation?'3."translation": traduction anglaise courte':''}
+100% assignés. JSON:{"results":[{"keyword":"...","category":"...","sebCategory":"..."${needsTranslation?',"translation":"..."':''}},...]}`,
+          `Marque:${config.brand}|Pays:${config.country}|Langue:${config.language}
+Catégories:${categories.join("|")}
+${batch.map(k=>`${k.keyword}|${k.volume}`).join("\n")}`
         );
         const parsed=parseJSON(resp);allResults.push(...(parsed.results||[]));
       }
@@ -534,18 +545,15 @@ JSON : {"results":[{"keyword":"...","category":"...","sebCategory":"..."${needsT
       for(let ci=0;ci<cats.length;ci++){
         const cat=cats[ci];
         const catKws=groups[cat].sort((a,b)=>b.volume-a.volume);
-        if(catKws.length<=3){result.push(...catKws);continue;}
-        setLoadMsg(`Dédup par catégorie — ${cat} (${ci+1}/${cats.length})…`);
-        const BATCH=80;
+        if(catKws.length<=5){result.push(...catKws);continue;} // skip small cats — no dedup needed
+        setLoadMsg(`Dédup — ${cat} (${ci+1}/${cats.length})…`);
+        const BATCH=100;
         const toRemove=new Set();
         for(let b=0;b<Math.ceil(catKws.length/BATCH);b++){
           const batch=catKws.slice(b*BATCH,(b+1)*BATCH);
           const resp=await callClaude(
-            `Dans la catégorie produit "${cat}", identifie les quasi-doublons sémantiques.
-Garde toujours le mot-clé avec le PLUS GRAND volume. Supprime les variantes (pluriel, accent, faute, ordre des mots, synonymes très proches).
-IMPORTANT : préserve la diversité sémantique — ne supprime pas deux mots-clés d'intention différente même s'ils se ressemblent.
-JSON : {"remove":["kw1","kw2",...]} — tableau vide si aucun doublon.`,
-            `Mots-clés de la catégorie "${cat}" (keyword|volume):\n${batch.map(k=>`${k.keyword}|${k.volume}`).join("\n")}`
+            `Catégorie "${cat}". Identifie les quasi-doublons (pluriel accent faute ordre). Garde toujours le plus grand volume. Préserve la diversité sémantique. JSON:{"remove":["kw1",...]}`,
+            `${batch.map(k=>`${k.keyword}|${k.volume}`).join("\n")}`
           );
           const parsed=parseJSON(resp);
           for(const kw of(parsed.remove||[]))toRemove.add(kw.toLowerCase().trim());
@@ -766,29 +774,27 @@ JSON : {"remove":["kw1","kw2",...]} — tableau vide si aucun doublon.`,
             <Stat value={cleanedKws.length||"?"} label="Après IA" color={G.green}/>
           </div>
 
-          {/* Passe 1 — rules */}
           {!cleanStats
             ?<div style={{marginBottom:12}}>
               <Tag n="Étape 1">Règles automatiques — instantané</Tag>
-              <Info>Supprime les marques connues, recettes, années, promos. Résultat immédiat.</Info>
+              <Info>Supprime les marques connues, recettes, années, promos, et les mots-clés à volume trop faible par rapport à la médiane de ta liste.</Info>
               <Btn onClick={()=>{runRuleBasedCleaning();addLog("🧹 Nettoyage règles lancé");}}>⚡ Lancer le nettoyage par règles</Btn>
             </div>
             :<div style={{background:G.green+"14",border:`1px solid ${G.green}44`,borderRadius:8,padding:"10px 14px",fontSize:12,color:G.green,marginBottom:14}}>
-              ✅ Règles : {cleanStats.afterRules} conservés
+              ✅ Règles : {cleanStats.afterRules} conservés sur {cleanStats.before}
+              {cleanStats.volumeThreshold&&<span style={{color:G.accent}}> · Seuil volume ≥ {cleanStats.volumeThreshold} ({cleanStats.removedByThreshold} écartés)</span>}
               {cleanStats.afterSmart!==undefined&&` · Passe IA : ${cleanStats.afterSmart}`}
-              {cleanStats.similarPairs?.length>0&&<span style={{color:G.yellow}}> · ⚠ {cleanStats.similarPairs.length} paires similaires détectées</span>}
+              {cleanStats.similarPairs?.length>0&&<span style={{color:G.yellow}}> · ⚠ {cleanStats.similarPairs.length} paires similaires</span>}
             </div>
           }
 
           {cleanStats&&<>
-            {/* Passe 2 — smart IA */}
             <div style={{borderTop:`1px solid ${G.border}`,paddingTop:16,marginBottom:16}}>
-              <Tag n="Étape 2">Passe intelligente IA — nettoyage fin + dédoublonnage</Tag>
+              <Tag n="Étape 2">Passe IA — nettoyage fin + dédoublonnage</Tag>
               <Info color={G.yellow}>
-                Claude analyse chaque batch de 80 mots-clés et fait tout en une fois : supprime les non-pertinents restants, dédoublonne les quasi-similaires (pluriel, accent, faute), vise l'objectif cible.<br/>
-                <strong style={{color:G.text}}>Relancer = affiner la liste actuelle</strong>, pas repartir de zéro.
+                Claude affine en supprimant ce que les règles n'ont pas capturé et dédoublonne les quasi-similaires. <strong style={{color:G.text}}>Relancer = affiner la liste actuelle</strong>, pas repartir de zéro.
               </Info>
-              {loading&&loadMsg.includes("Passe")?<Spin msg={loadMsg}/>:<Btn onClick={runSmartCleaning} color={G.yellow}>🤖 Lancer la passe intelligente ({cleanedKws.length} mots-clés)</Btn>}
+              {loading?<Spin msg={loadMsg}/>:<Btn onClick={runSmartCleaning} color={G.yellow}>🤖 Lancer la passe IA ({cleanedKws.length} mots-clés)</Btn>}
             </div>
 
             {/* Similarity pairs alert */}
