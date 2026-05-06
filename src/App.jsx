@@ -8,23 +8,44 @@ const G = {
 
 const PASSWORD = "sqli2026";
 
-// ─── API — via Vercel proxy (clé côté serveur) ────────────────────────────────
+// ─── IMAGE COMPRESSION — resize to max 1024px before sending to avoid Vercel 4.5MB limit
+async function compressImage(file) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      const MAX = 1024;
+      let { width, height } = img;
+      if (width > MAX || height > MAX) {
+        if (width > height) { height = Math.round(height * MAX / width); width = MAX; }
+        else { width = Math.round(width * MAX / height); height = MAX; }
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = width; canvas.height = height;
+      canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+      URL.revokeObjectURL(url);
+      resolve(canvas.toDataURL("image/jpeg", 0.75).split(",")[1]);
+    };
+    img.src = url;
+  });
+}
+
+// ─── API — via Vercel proxy ────────────────────────────────────────────────────
 async function callClaude(system, userText, images=[]) {
   const content=[];
-  for(const img of images) content.push({type:"image",source:{type:"base64",media_type:img.type,data:img.data}});
+  for(const img of images) content.push({type:"image",source:{type:"base64",media_type:"image/jpeg",data:img.compressed||img.data}});
   content.push({type:"text",text:userText});
   const res=await fetch("/api/claude",{
     method:"POST",
     headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({
-      model:"claude-sonnet-4-20250514",
-      max_tokens:8000,
-      system,
-      messages:[{role:"user",content}]
-    }),
+    body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:8000,system,messages:[{role:"user",content}]}),
   });
-  if(!res.ok){const e=await res.json();throw new Error(e.error?.message||`API ${res.status}`);}
-  return (await res.json()).content[0].text;
+  // Handle non-JSON error responses (e.g. Vercel "Request Entity Too Large")
+  const text=await res.text();
+  let data;
+  try{data=JSON.parse(text);}catch{throw new Error(`Erreur serveur: ${text.slice(0,120)}`);}
+  if(!res.ok)throw new Error(data.error?.message||`API ${res.status}`);
+  return data.content[0].text;
 }
 
 function parseJSON(raw){
@@ -442,7 +463,9 @@ export default function App(){
           <Sub c="Extraire les catégories du menu, puis générer 10 mots-clés génériques par catégorie."/>
           <Tag n="2.1">Captures d'écran du menu → extraction automatique</Tag>
           <Info>Screenshots de toutes les entrées et sous-entrées du menu → Claude extrait les catégories produits.</Info>
-          <Drop label="Captures d'écran du menu (PNG, JPG)" note="Toutes les entrées et sous-entrées" accept="image/*" multiple onFiles={async files=>{const imgs=await Promise.all(files.map(async f=>({name:f.name,data:await readFileAsBase64(f),type:f.type})));setCatImages(prev=>[...prev,...imgs]);}}>
+          <Drop label="Captures d'écran du menu (PNG, JPG)" note="Toutes les entrées et sous-entrées" accept="image/*" multiple onFiles={async files=>{
+            const imgs=await Promise.all(files.map(async f=>({name:f.name,type:f.type,data:await readFileAsBase64(f),compressed:await compressImage(f)})));
+            setCatImages(prev=>[...prev,...imgs]);}}>
             {catImages.length>0&&<div style={{marginTop:8,display:"flex",flexWrap:"wrap",gap:4,justifyContent:"center"}}>{catImages.map((img,i)=><span key={i} style={{fontSize:10,background:G.accent+"22",border:`1px solid ${G.accent}44`,color:G.accent,padding:"2px 7px",borderRadius:4}}>🖼 {img.name}</span>)}</div>}
           </Drop>
           {catImages.length>0&&!loading&&categories.length===0&&<div style={{marginTop:10,display:"flex",justifyContent:"flex-end"}}><Btn onClick={extractCategories}>🤖 Extraire les catégories</Btn></div>}
@@ -686,7 +709,7 @@ export default function App(){
         {log.length>0&&<div style={{marginTop:24}}>
           <div style={{fontSize:11,color:G.muted,marginBottom:6,textTransform:"uppercase",letterSpacing:".07em"}}>Journal</div>
           <div style={{background:G.card,border:`1px solid ${G.border}`,borderRadius:8,padding:"12px 16px"}}>
-            {log.map((l,i)=><div key={i} style={{fontSize:12,color:G.sub,padding:"3px 0",borderBottom:`1px solid ${G.faint}`}}>{l}</div>)}
+            {log.map((l,i)=><div key={i} style={{fontSize:12,color:G.sub,padding:"3px 0",borderBottom:`1px solid ${G.faint}`,textAlign:"left"}}>{l}</div>)}
           </div>
         </div>}
       </div>
