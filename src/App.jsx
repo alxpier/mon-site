@@ -8,13 +8,13 @@ const G = {
 
 const PASSWORD = "sqli2026";
 
-// ─── IMAGE COMPRESSION — resize to max 1024px before sending to avoid Vercel 4.5MB limit
+// ─── IMAGE COMPRESSION — max 800px, 55% quality to stay under Vercel 4.5MB limit
 async function compressImage(file) {
   return new Promise((resolve) => {
     const img = new Image();
     const url = URL.createObjectURL(file);
     img.onload = () => {
-      const MAX = 1024;
+      const MAX = 800;
       let { width, height } = img;
       if (width > MAX || height > MAX) {
         if (width > height) { height = Math.round(height * MAX / width); width = MAX; }
@@ -24,28 +24,50 @@ async function compressImage(file) {
       canvas.width = width; canvas.height = height;
       canvas.getContext("2d").drawImage(img, 0, 0, width, height);
       URL.revokeObjectURL(url);
-      resolve(canvas.toDataURL("image/jpeg", 0.75).split(",")[1]);
+      resolve(canvas.toDataURL("image/jpeg", 0.55).split(",")[1]);
     };
     img.src = url;
   });
 }
 
-// ─── API — via Vercel proxy ────────────────────────────────────────────────────
+// ─── API — via Vercel proxy, images sent one at a time ────────────────────────
 async function callClaude(system, userText, images=[]) {
+  // If multiple images, send them one by one and combine into a single request
+  // Each image is kept separate to stay under the 4.5MB Vercel limit
   const content=[];
-  for(const img of images) content.push({type:"image",source:{type:"base64",media_type:"image/jpeg",data:img.compressed||img.data}});
+  for(const img of images) {
+    content.push({type:"image",source:{type:"base64",media_type:"image/jpeg",data:img.compressed||img.data}});
+  }
   content.push({type:"text",text:userText});
   const res=await fetch("/api/claude",{
     method:"POST",
     headers:{"Content-Type":"application/json"},
     body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:8000,system,messages:[{role:"user",content}]}),
   });
-  // Handle non-JSON error responses (e.g. Vercel "Request Entity Too Large")
   const text=await res.text();
   let data;
-  try{data=JSON.parse(text);}catch{throw new Error(`Erreur serveur: ${text.slice(0,120)}`);}
+  try{data=JSON.parse(text);}catch{throw new Error(`Erreur serveur (${res.status}): ${text.slice(0,200)}`);}
   if(!res.ok)throw new Error(data.error?.message||`API ${res.status}`);
   return data.content[0].text;
+}
+
+// ─── EXTRACT CATEGORIES — send images 2 by 2 to avoid payload limit ───────────
+async function extractCategoriesFromImages(images, config, system) {
+  const CHUNK = 2; // max 2 images per request
+  let allCategories = [];
+  for (let i = 0; i < images.length; i += CHUNK) {
+    const chunk = images.slice(i, i + CHUNK);
+    const resp = await callClaude(system,
+      `Site:${config.siteUrl}|Pays:${config.country}|Langue:${config.language}\nCapture ${i+1} à ${Math.min(i+CHUNK, images.length)} sur ${images.length}. Extrais uniquement les catégories visibles dans CES captures. JSON : {"categories":["cat1",...]}`,
+      chunk
+    );
+    try {
+      const parsed = JSON.parse(resp.replace(/```json|```/g,"").trim().match(/\{[\s\S]*\}/)?.[0]||"{}");
+      allCategories.push(...(parsed.categories||[]));
+    } catch {}
+  }
+  // Deduplicate
+  return [...new Set(allCategories)];
 }
 
 function parseJSON(raw){
@@ -138,12 +160,33 @@ function dedup(rows){
 const BRAND_BLACKLIST=["tefal","rowenta","krups","moulinex","calor","seb ","imusa","wmf","all-clad","lagostina","t-fal","supor","cuisinart","kitchenaid","breville","ninja","instant pot","hamilton beach","black+decker","black decker","blackdecker","philips","braun","bosch","siemens","kenwood","delonghi","de'longhi","nespresso","keurig","amazon","walmart","target","lidl","aldi","costco","ikea","presto","lodge","le creuset","staub","mauviel","demeyere","fissler","tramontina"];
 const NOISE_RX=[/\brecette[s]?\b/i,/\brecipe[s]?\b/i,/\breceta[s]?\b/i,/\b20[0-9]{2}\b/,/black friday/i,/cyber monday/i,/\bsoldes?\b/i,/wikipedia/i,/youtube/i,/instagram/i,/facebook/i,/\bebay\b/i,/\bcdiscount\b/i];
 function ruleBasedClean(kws){return kws.filter(({keyword})=>{const kw=keyword.toLowerCase();if(BRAND_BLACKLIST.some(b=>kw.includes(b)))return false;if(NOISE_RX.some(p=>p.test(kw)))return false;return true;});}
-function buildBalancedList(kws,target){
+function buildBalancedList(kws, target, minPerCat=5){
   const groups={};
   for(const k of kws){const cat=k.category||"Autre";if(!groups[cat])groups[cat]=[];groups[cat].push(k);}
   const cats=Object.keys(groups);if(!cats.length)return kws.slice(0,target);
-  const total=kws.length;const selected=[];
-  cats.forEach(cat=>{const quota=Math.max(1,Math.round(target*(groups[cat].length/total)));selected.push(...[...groups[cat]].sort((a,b)=>b.volume-a.volume).slice(0,quota));});
+  // Sort each group by volume desc
+  for(const cat of cats) groups[cat].sort((a,b)=>b.volume-a.volume);
+  // Step 1: guarantee minimum per category
+  const floor=Math.min(minPerCat,Math.floor(target/cats.length));
+  const selected=[];
+  const remaining={};
+  for(const cat of cats){
+    const take=Math.min(floor,groups[cat].length);
+    selected.push(...groups[cat].slice(0,take));
+    remaining[cat]=groups[cat].slice(take);
+  }
+  // Step 2: distribute remaining budget proportionally by group size
+  const budget=target-selected.length;
+  if(budget>0){
+    const totalRemaining=Object.values(remaining).reduce((s,g)=>s+g.length,0);
+    if(totalRemaining>0){
+      cats.forEach(cat=>{
+        if(!remaining[cat].length)return;
+        const quota=Math.round(budget*(remaining[cat].length/totalRemaining));
+        selected.push(...remaining[cat].slice(0,quota));
+      });
+    }
+  }
   return selected.sort((a,b)=>b.volume-a.volume).slice(0,target);
 }
 function dl(content,filename,type="text/plain;charset=utf-8;"){
@@ -153,7 +196,7 @@ function dl(content,filename,type="text/plain;charset=utf-8;"){
 function dlCSV(rows,filename){dl("\uFEFF"+rows.map(r=>r.map(c=>`"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n"),filename,"text/csv;charset=utf-8;");}
 
 const SEB_CATS=["LINEN CARE","HOME COMFORT","PERSONAL CARE","ELECTRICAL COOKING","FOOD PREPARATION","BEVERAGE","FLOOR CARE","COOKWARE & BAKEWARE","KITCHENWARE & DINNER"];
-const STEPS=["Projet","Catégories","Mots-clés","Volumes","Nettoyage","Catégorisation","Export"];
+const STEPS=["Projet","Catégories","Mots-clés","Volumes","Nettoyage","Catégorisation","Sélection","Export"];
 
 // ─── UI COMPONENTS ────────────────────────────────────────────────────────────
 function Card({children,style={}}){return <div style={{background:G.card,border:`1px solid ${G.border}`,borderRadius:12,padding:28,...style}}>{children}</div>;}
@@ -291,8 +334,12 @@ export default function App(){
   const [rawWithVol,setRawWithVol]=useState([]);
   const [cleanedKws,setCleanedKws]=useState([]);
   const [cleanStats,setCleanStats]=useState(null);
+  const [cleanTarget,setCleanTarget]=useState(500);
   const [categorizedKws,setCategorizedKws]=useState([]);
+  const [dedupedKws,setDedupedKws]=useState([]);
+  const [dedupStats,setDedupStats]=useState(null);
   const [targetCount,setTargetCount]=useState(500);
+  const [minPerCat,setMinPerCat]=useState(5);
 
   const addLog=useCallback(m=>setLog(l=>[...l,m]),[]);
   const nav=s=>{setStep(s);setErr("");};
@@ -314,8 +361,9 @@ export default function App(){
   async function extractCategories(){
     setLoading(true);setErr("");setLoadMsg("Analyse du menu…");
     try{
-      const resp=await callClaude(`Expert SEO. Extrais les sous-catégories produits génériques du menu. Règles : types de produits génériques uniquement · pas de marques SEB · pas de gammes/collections · pas de catégories générales · "A & B" → deux entrées · pratique → type produit. JSON : {"categories":["cat1",...]}`,`Site:${config.siteUrl}|Pays:${config.country}|Langue:${config.language}`,catImages);
-      const{categories:cats}=parseJSON(resp);setCategories(cats);addLog(`✅ ${cats.length} catégories extraites`);
+      const system=`Expert SEO. Extrais les sous-catégories produits génériques du menu. Règles : types de produits génériques uniquement · pas de marques SEB · pas de gammes/collections · pas de catégories générales · "A & B" → deux entrées · pratique → type produit. JSON : {"categories":["cat1",...]}`;
+      const cats = await extractCategoriesFromImages(catImages, config, system);
+      setCategories(cats);addLog(`✅ ${cats.length} catégories extraites`);
     }catch(e){setErr("Erreur: "+e.message);}
     setLoading(false);
   }
@@ -363,57 +411,154 @@ export default function App(){
     setRawWithVol(merged);setTargetCount(Math.min(500,merged.length));
     addLog(`📊 ${f.name} → ${merged.length} mots-clés avec volumes (${sources.length-merged.length} sans volume écartés)`);setErr("");
   }
-  function runRuleBasedCleaning(){
-    const before=rawWithVol.length;const cleaned=ruleBasedClean(rawWithVol);
-    setCleanedKws(cleaned);setCleanStats({before,afterRules:cleaned.length});
-    addLog(`✅ Nettoyage règles : ${cleaned.length}/${before} conservés`);
+  // ── Levenshtein similarity score (local, no API) ──────────────────────────
+  function levenshtein(a, b) {
+    const m=a.length, n=b.length;
+    const dp=Array.from({length:m+1},(_,i)=>Array.from({length:n+1},(_,j)=>i===0?j:j===0?i:0));
+    for(let i=1;i<=m;i++) for(let j=1;j<=n;j++) dp[i][j]=a[i-1]===b[j-1]?dp[i-1][j-1]:1+Math.min(dp[i-1][j],dp[i][j-1],dp[i-1][j-1]);
+    return dp[m][n];
   }
-  async function runClaudeDedup(){
-    if(!cleanedKws.length)return;setLoading(true);setErr("");
-    const BATCH=80;const total=Math.ceil(cleanedKws.length/BATCH);const toRemove=new Set();
-    try{
-      for(let b=0;b<total;b++){
-        setLoadMsg(`Dédoublonnage — batch ${b+1}/${total}…`);
-        const batch=cleanedKws.slice(b*BATCH,(b+1)*BATCH);
-        const resp=await callClaude(`Liste de mots-clés SEO triés par volume décroissant. Identifie les quasi-doublons (pluriel, accent, faute, ordre des mots). Garde toujours celui avec le plus grand volume. Liste uniquement ceux à supprimer. JSON : {"remove":["kw1",...]}`,`Mots-clés (keyword|volume):\n${batch.map(k=>`${k.keyword}|${k.volume}`).join("\n")}`);
-        const parsed=parseJSON(resp);for(const kw of(parsed.remove||[]))toRemove.add(kw.toLowerCase().trim());
+  function similarityScore(a, b) {
+    const na=a.toLowerCase().trim(), nb=b.toLowerCase().trim();
+    const maxLen=Math.max(na.length,nb.length);
+    if(maxLen===0)return 1;
+    return 1-(levenshtein(na,nb)/maxLen);
+  }
+  function detectSimilarPairs(kws, threshold=0.82) {
+    // Check cross-batch similarity — compare each kw against next 30 neighbors by alpha order
+    const sorted=[...kws].sort((a,b)=>a.keyword.localeCompare(b.keyword));
+    const pairs=[];
+    for(let i=0;i<sorted.length;i++){
+      for(let j=i+1;j<Math.min(i+30,sorted.length);j++){
+        const score=similarityScore(sorted[i].keyword,sorted[j].keyword);
+        if(score>=threshold) pairs.push({a:sorted[i],b:sorted[j],score:Math.round(score*100)});
       }
-      const deduped=cleanedKws.filter(k=>!toRemove.has(k.keyword.toLowerCase().trim()));
-      setCleanedKws(deduped);setCleanStats(s=>({...s,afterDedup:deduped.length,dedupRemoved:toRemove.size}));
-      addLog(`✅ Dédoublonnage : ${deduped.length} conservés (${toRemove.size} supprimés)`);
-    }catch(e){setErr("Erreur: "+e.message);}
-    setLoading(false);
+    }
+    return pairs;
   }
-  async function runClaudeSemanticPass(){
-    if(!cleanedKws.length)return;setLoading(true);setErr("");
-    const BATCH=80;const total=Math.ceil(cleanedKws.length/BATCH);const kept=[];
+
+  function runRuleBasedCleaning(){
+    const before=rawWithVol.length;
+    const cleaned=ruleBasedClean(rawWithVol);
+    setCleanedKws(cleaned);
+    setCleanStats({before,afterRules:cleaned.length});
+    addLog(`✅ Nettoyage règles : ${cleaned.length}/${before} conservés (${before-cleaned.length} supprimés)`);
+  }
+
+  async function runSmartCleaning(){
+    if(!cleanedKws.length)return;
+    setLoading(true);setErr("");
+    const source=cleanedKws; // refine current list, not rawWithVol
+    const BATCH=80;
+    const total=Math.ceil(source.length/BATCH);
+    const kept=[];
     try{
       for(let b=0;b<total;b++){
-        setLoadMsg(`Affinage sémantique — batch ${b+1}/${total}…`);
-        const batch=cleanedKws.slice(b*BATCH,(b+1)*BATCH);
-        const resp=await callClaude(`Expert SEO. Supprime uniquement les mots-clés clairement hors-périmètre. Conserve tout ce qui est pertinent. JSON : {"kept":["kw1",...]}`,`Catégories:${categories.join(", ")}\nMots-clés:\n${batch.map(k=>k.keyword).join("\n")}`);
-        const parsed=parseJSON(resp);const keptSet=new Set((parsed.kept||[]).map(k=>k.toLowerCase().trim()));
+        setLoadMsg(`Nettoyage IA — batch ${b+1}/${total}…`);
+        const batch=source.slice(b*BATCH,(b+1)*BATCH);
+        const resp=await callClaude(
+          `Tu es un expert SEO. Nettoie cette liste de mots-clés en une seule passe.
+
+SUPPRIMER obligatoirement :
+- Toutes les marques (Tefal, Rowenta, Krups, Moulinex, Calor, SEB, WMF, Imusa, Tramontina, et tous concurrents locaux)
+- Mots-clés recettes / cuisine (contenu, pas produit) : receta, recipe, recette, cómo hacer, comment faire, preparar…
+- Années (2023, 2024…), événements promo (Black Friday, soldes, oferta especial…)
+- Réseaux sociaux, Wikipedia, YouTube, Amazon, Walmart, eBay, noms de personnes
+- Mots trop génériques sans lien direct avec les catégories produits (ex: "cocina", "hogar" seuls)
+- Quasi-doublons : si deux mots-clés sont quasi-identiques (pluriel, accent, faute, ordre des mots), garder uniquement celui avec le PLUS GRAND volume
+
+GARDER ABSOLUMENT : tout mot-clé générique avec une intention produit claire (achat, comparaison, avis, entretien, utilisation, caractéristiques) — même à faible volume s'il est unique sémantiquement.
+
+Réponds UNIQUEMENT en JSON : {"kept":["kw1","kw2",...]}`,
+          `Marque:${config.brand}|Pays:${config.country}|Langue:${config.language}
+Catégories produits: ${categories.join(", ")}
+Mots-clés (keyword|volume):\n${batch.map(k=>`${k.keyword}|${k.volume}`).join("\n")}`
+        );
+        const parsed=parseJSON(resp);
+        const keptSet=new Set((parsed.kept||[]).map(k=>k.toLowerCase().trim()));
         kept.push(...batch.filter(k=>keptSet.has(k.keyword.toLowerCase().trim())));
       }
-      setCleanedKws(kept);setCleanStats(s=>({...s,afterSemantic:kept.length}));addLog(`✅ Affinage sémantique : ${kept.length} conservés`);
+      // Local similarity detection cross-batches
+      const pairs=detectSimilarPairs(kept);
+      setCleanedKws(kept);
+      setCleanStats(s=>({...s,afterSmart:kept.length,similarPairs:pairs}));
+      addLog(`✅ Nettoyage IA : ${kept.length} conservés (${source.length-kept.length} supprimés) · ${pairs.length} paires similaires cross-batches`);
     }catch(e){setErr("Erreur: "+e.message);}
     setLoading(false);
   }
   async function runCategorization(){
     setLoading(true);setErr("");
-    const kws=cleanedKws.filter(k=>k.volume>0);const BATCH=80;const allResults=[];const total=Math.ceil(kws.length/BATCH);
+    const kws=cleanedKws.filter(k=>k.volume>0);
+    const BATCH=80;const allResults=[];const total=Math.ceil(kws.length/BATCH);
+    const needsTranslation=!["fr","français","french","en","english","anglais"].some(l=>config.language.toLowerCase().includes(l));
     try{
       for(let b=0;b<total;b++){
         setLoadMsg(`Catégorisation batch ${b+1}/${total}…`);
         const batch=kws.slice(b*BATCH,(b+1)*BATCH);
-        const resp=await callClaude(`Expert SEO et produit Groupe SEB. Pour chaque mot-clé assigne : 1. "category" : catégorie produit exacte parmi la liste fournie 2. "sebCategory" : parmi ${SEB_CATS.join(", ")} 100% assignés, jamais Uncategorized, ne pas modifier le texte. JSON : {"results":[{"keyword":"...","category":"...","sebCategory":"..."},...]}`,`Marque:${config.brand}|Pays:${config.country}|Langue:${config.language}\nCatégories:\n${categories.join("\n")}\nMots-clés:\n${batch.map(k=>`${k.keyword}|${k.volume}`).join("\n")}`);
+        const resp=await callClaude(
+          `Expert SEO et produit Groupe SEB. Pour chaque mot-clé assigne :
+1. "category" : catégorie produit exacte parmi la liste fournie
+2. "sebCategory" : parmi ${SEB_CATS.join(", ")}
+${needsTranslation?'3. "translation" : traduction anglaise du mot-clé (courte, naturelle)':''}
+100% assignés, jamais Uncategorized, ne pas modifier le texte original.
+JSON : {"results":[{"keyword":"...","category":"...","sebCategory":"..."${needsTranslation?',"translation":"..."':''}},...]}`,
+          `Marque:${config.brand}|Pays:${config.country}|Langue:${config.language}\nCatégories:\n${categories.join("\n")}\nMots-clés:\n${batch.map(k=>`${k.keyword}|${k.volume}`).join("\n")}`
+        );
         const parsed=parseJSON(resp);allResults.push(...(parsed.results||[]));
       }
       const map=new Map(allResults.map(r=>[r.keyword.toLowerCase().trim(),r]));
-      const final=kws.map(k=>{const r=map.get(k.keyword.toLowerCase().trim());return{...k,category:r?.category||categories[0],sebCategory:r?.sebCategory||SEB_CATS[0]};});
+      const final=kws.map(k=>{
+        const r=map.get(k.keyword.toLowerCase().trim());
+        return{...k,category:r?.category||categories[0],sebCategory:r?.sebCategory||SEB_CATS[0],translation:r?.translation||""};
+      });
       setCategorizedKws(final);setTargetCount(Math.min(targetCount,final.length));
-      addLog(`✅ Catégorisation : ${final.length} mots-clés (${total} batches)`);nav(6);
+      addLog(`✅ Catégorisation : ${final.length} mots-clés${needsTranslation?" (avec traductions EN)":""} (${total} batches)`);
+      // Auto-run local similarity detection on categorized list
+      const pairs=detectSimilarPairs(final);
+      setDedupStats({total:final.length,similarPairs:pairs});
+      nav(6); // go to selection/dedup step
     }catch(e){setErr("Erreur catégorisation: "+e.message);}
+    setLoading(false);
+  }
+
+  async function runDedupByCategory(){
+    if(!categorizedKws.length)return;
+    setLoading(true);setErr("");
+    // Dedup within each category using Claude — batches of 80 per category
+    const groups={};
+    for(const k of categorizedKws){if(!groups[k.category])groups[k.category]=[];groups[k.category].push(k);}
+    const result=[];
+    const cats=Object.keys(groups);
+    let totalRemoved=0;
+    try{
+      for(let ci=0;ci<cats.length;ci++){
+        const cat=cats[ci];
+        const catKws=groups[cat].sort((a,b)=>b.volume-a.volume);
+        if(catKws.length<=3){result.push(...catKws);continue;}
+        setLoadMsg(`Dédup par catégorie — ${cat} (${ci+1}/${cats.length})…`);
+        const BATCH=80;
+        const toRemove=new Set();
+        for(let b=0;b<Math.ceil(catKws.length/BATCH);b++){
+          const batch=catKws.slice(b*BATCH,(b+1)*BATCH);
+          const resp=await callClaude(
+            `Dans la catégorie produit "${cat}", identifie les quasi-doublons sémantiques.
+Garde toujours le mot-clé avec le PLUS GRAND volume. Supprime les variantes (pluriel, accent, faute, ordre des mots, synonymes très proches).
+IMPORTANT : préserve la diversité sémantique — ne supprime pas deux mots-clés d'intention différente même s'ils se ressemblent.
+JSON : {"remove":["kw1","kw2",...]} — tableau vide si aucun doublon.`,
+            `Mots-clés de la catégorie "${cat}" (keyword|volume):\n${batch.map(k=>`${k.keyword}|${k.volume}`).join("\n")}`
+          );
+          const parsed=parseJSON(resp);
+          for(const kw of(parsed.remove||[]))toRemove.add(kw.toLowerCase().trim());
+        }
+        const kept=catKws.filter(k=>!toRemove.has(k.keyword.toLowerCase().trim()));
+        totalRemoved+=toRemove.size;
+        result.push(...kept);
+      }
+      setDedupedKws(result.sort((a,b)=>b.volume-a.volume));
+      const pairs=detectSimilarPairs(result);
+      setDedupStats(s=>({...s,afterDedup:result.length,dedupRemoved:totalRemoved,similarPairs:pairs}));
+      addLog(`✅ Dédup par catégorie : ${result.length} conservés (${totalRemoved} supprimés)`);
+    }catch(e){setErr("Erreur dédup: "+e.message);}
     setLoading(false);
   }
 
@@ -436,10 +581,10 @@ export default function App(){
         <div><div style={{fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,fontSize:15,color:"#fff"}}>SEO Keyword Pipeline</div><div style={{fontSize:11,color:G.muted}}>Groupe SEB</div></div>
         <div style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:12}}>
           <StepBar step={step}/>
-          {step>0&&<button onClick={()=>{if(!window.confirm("Recommencer ? Toutes les données seront effacées."))return;setStep(0);setErr("");setLog([]);setConfig({brand:"",country:"",language:"",siteUrl:""});setCatImages([]);setCategories([]);setCatManual("");setEnrichedKws([]);setEnrichPreview("");setEnrichValidated(false);setKwSub(0);setCompetitors([]);setSourceKws([]);setRawWithVol([]);setCleanedKws([]);setCleanStats(null);setCategorizedKws([]);setTargetCount(500);}} style={{background:"none",border:`1px solid ${G.red}44`,color:G.red+"cc",padding:"5px 12px",borderRadius:6,fontFamily:"inherit",fontSize:11,cursor:"pointer",whiteSpace:"nowrap",flexShrink:0}}>🔄 Nouveau projet</button>}
+          {step>0&&<button onClick={()=>{if(!window.confirm("Recommencer ? Toutes les données seront effacées."))return;setStep(0);setErr("");setLog([]);setConfig({brand:"",country:"",language:"",siteUrl:""});setCatImages([]);setCategories([]);setCatManual("");setEnrichedKws([]);setEnrichPreview("");setEnrichValidated(false);setKwSub(0);setCompetitors([]);setSourceKws([]);setRawWithVol([]);setCleanedKws([]);setCleanStats(null);setCleanTarget(500);setCategorizedKws([]);setDedupedKws([]);setDedupStats(null);setTargetCount(500);setMinPerCat(5);}} style={{background:"none",border:`1px solid ${G.red}44`,color:G.red+"cc",padding:"5px 12px",borderRadius:6,fontFamily:"inherit",fontSize:11,cursor:"pointer",whiteSpace:"nowrap",flexShrink:0}}>🔄 Nouveau projet</button>}
         </div>
       </div>
-      <div style={{height:3,background:G.border}}><div style={{height:"100%",width:`${(step/6)*100}%`,background:"linear-gradient(90deg,#3b82f6,#22c55e)",transition:"width .4s"}}/></div>
+      <div style={{height:3,background:G.border}}><div style={{height:"100%",width:`${(step/7)*100}%`,background:"linear-gradient(90deg,#3b82f6,#22c55e)",transition:"width .4s"}}/></div>
 
       <div style={{maxWidth:860,margin:"0 auto",padding:"28px 20px"}}>
         <ErrBox msg={err}/>
@@ -611,46 +756,78 @@ export default function App(){
         </Card>}
 
         {step===4&&<Card>
-          <H2 c="🧹 Nettoyage + dédoublonnage intelligent"/>
-          <Sub c="Volumes disponibles — les quasi-doublons sont gérés par volume : on garde toujours le meilleur."/>
-          <Tag n="Passe 1">Nettoyage par règles — instantané</Tag>
-          <Info>Supprime automatiquement : marques connues · recettes · années · promos.</Info>
+          <H2 c="🧹 Nettoyage intelligent"/>
+          <Sub c="Deux passes : règles automatiques instantanées, puis IA pour le nettoyage fin et le dédoublonnage dans chaque batch. Relancer la passe IA affine la liste existante sans repartir de zéro."/>
+
+          {/* Stats */}
           <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:14}}>
             <Stat value={rawWithVol.length} label="Avec volumes" color={G.yellow}/>
-            <Stat value={cleanStats?.afterRules??"?"} label="Après règles" color={G.accent}/>
-            <Stat value={cleanStats?.afterDedup??cleanStats?.afterRules??"?"} label="Après dédup." color={G.green}/>
+            <Stat value={cleanStats?.afterRules??rawWithVol.length} label="Après règles" color={G.accent}/>
+            <Stat value={cleanedKws.length||"?"} label="Après IA" color={G.green}/>
           </div>
-          {!cleanStats?<Btn onClick={()=>{runRuleBasedCleaning();addLog("🧹 Nettoyage règles lancé");}}>⚡ Lancer le nettoyage (instantané)</Btn>
-            :<div style={{background:G.green+"14",border:`1px solid ${G.green}44`,borderRadius:8,padding:"12px 14px",fontSize:12,color:G.green,marginBottom:12}}>
-              ✅ Règles : {cleanStats.afterRules} conservés{cleanStats.afterDedup!==undefined&&` · Dédup : ${cleanStats.afterDedup} (${cleanStats.dedupRemoved} supprimés)`}{cleanStats.afterSemantic!==undefined&&` · Sémantique : ${cleanStats.afterSemantic}`}
-            </div>}
+
+          {/* Passe 1 — rules */}
+          {!cleanStats
+            ?<div style={{marginBottom:12}}>
+              <Tag n="Étape 1">Règles automatiques — instantané</Tag>
+              <Info>Supprime les marques connues, recettes, années, promos. Résultat immédiat.</Info>
+              <Btn onClick={()=>{runRuleBasedCleaning();addLog("🧹 Nettoyage règles lancé");}}>⚡ Lancer le nettoyage par règles</Btn>
+            </div>
+            :<div style={{background:G.green+"14",border:`1px solid ${G.green}44`,borderRadius:8,padding:"10px 14px",fontSize:12,color:G.green,marginBottom:14}}>
+              ✅ Règles : {cleanStats.afterRules} conservés
+              {cleanStats.afterSmart!==undefined&&` · Passe IA : ${cleanStats.afterSmart}`}
+              {cleanStats.similarPairs?.length>0&&<span style={{color:G.yellow}}> · ⚠ {cleanStats.similarPairs.length} paires similaires détectées</span>}
+            </div>
+          }
+
           {cleanStats&&<>
-            <div style={{marginBottom:16}}>
+            {/* Passe 2 — smart IA */}
+            <div style={{borderTop:`1px solid ${G.border}`,paddingTop:16,marginBottom:16}}>
+              <Tag n="Étape 2">Passe intelligente IA — nettoyage fin + dédoublonnage</Tag>
+              <Info color={G.yellow}>
+                Claude analyse chaque batch de 80 mots-clés et fait tout en une fois : supprime les non-pertinents restants, dédoublonne les quasi-similaires (pluriel, accent, faute), vise l'objectif cible.<br/>
+                <strong style={{color:G.text}}>Relancer = affiner la liste actuelle</strong>, pas repartir de zéro.
+              </Info>
+              {loading&&loadMsg.includes("Passe")?<Spin msg={loadMsg}/>:<Btn onClick={runSmartCleaning} color={G.yellow}>🤖 Lancer la passe intelligente ({cleanedKws.length} mots-clés)</Btn>}
+            </div>
+
+            {/* Similarity pairs alert */}
+            {cleanStats.similarPairs?.length>0&&<div style={{borderTop:`1px solid ${G.border}`,paddingTop:16,marginBottom:16}}>
+              <div style={{fontSize:12,color:G.yellow,fontWeight:600,marginBottom:8}}>⚠ {cleanStats.similarPairs.length} paires potentiellement similaires (score ≥ 82%)</div>
+              <div style={{maxHeight:140,overflowY:"auto",background:G.faint,borderRadius:8,padding:"8px 12px",fontSize:11}}>
+                {cleanStats.similarPairs.slice(0,20).map((p,i)=>(
+                  <div key={i} style={{display:"grid",gridTemplateColumns:"1fr 30px 1fr 40px",gap:6,padding:"3px 0",borderBottom:`1px solid ${G.border}`,alignItems:"center"}}>
+                    <span style={{color:G.sub}}>{p.a.keyword} <span style={{color:G.muted}}>({p.a.volume})</span></span>
+                    <span style={{color:G.muted,textAlign:"center"}}>↔</span>
+                    <span style={{color:G.sub}}>{p.b.keyword} <span style={{color:G.muted}}>({p.b.volume})</span></span>
+                    <span style={{color:G.yellow,textAlign:"right"}}>{p.score}%</span>
+                  </div>
+                ))}
+                {cleanStats.similarPairs.length>20&&<div style={{color:G.muted,padding:"4px 0"}}>… {cleanStats.similarPairs.length-20} autres paires</div>}
+              </div>
+              <div style={{fontSize:11,color:G.muted,marginTop:6}}>Relance la passe intelligente pour les traiter, ou supprime-les manuellement ci-dessous.</div>
+            </div>}
+
+            {/* Manual list */}
+            <div style={{borderTop:`1px solid ${G.border}`,paddingTop:16,marginBottom:12}}>
               <div style={{fontSize:12,color:G.text,fontWeight:600,marginBottom:8}}>Liste actuelle ({cleanedKws.length} mots-clés) :</div>
               <div style={{maxHeight:220,overflowY:"auto",background:G.faint,borderRadius:8,padding:"8px 12px"}}>
                 <div style={{display:"grid",gridTemplateColumns:"1fr 80px 24px",paddingBottom:6,position:"sticky",top:0,background:G.faint}}>
                   <div style={{fontSize:10,color:G.muted,textTransform:"uppercase",letterSpacing:".06em"}}>Mot-clé</div>
                   <div style={{fontSize:10,color:G.muted,textTransform:"uppercase",letterSpacing:".06em",textAlign:"right"}}>Volume</div>
                 </div>
-                {cleanedKws.map((k,i)=><div key={i} style={{display:"grid",gridTemplateColumns:"1fr 80px 24px",padding:"3px 0",borderBottom:`1px solid ${G.border}`}}>
-                  <span style={{color:G.sub,fontSize:12}}>{k.keyword}</span>
-                  <span style={{color:G.accent,fontSize:12,textAlign:"right"}}>{k.volume.toLocaleString()}</span>
-                  <button onClick={()=>setCleanedKws(prev=>prev.filter((_,j)=>j!==i))} style={{background:"none",border:"none",color:G.red+"88",cursor:"pointer",fontSize:11,padding:0}}>✕</button>
-                </div>)}
+                {cleanedKws.map((k,i)=>(
+                  <div key={i} style={{display:"grid",gridTemplateColumns:"1fr 80px 24px",padding:"3px 0",borderBottom:`1px solid ${G.border}`}}>
+                    <span style={{color:G.sub,fontSize:12}}>{k.keyword}</span>
+                    <span style={{color:G.accent,fontSize:12,textAlign:"right"}}>{k.volume.toLocaleString()}</span>
+                    <button onClick={()=>setCleanedKws(prev=>prev.filter((_,j)=>j!==i))} style={{background:"none",border:"none",color:G.red+"88",cursor:"pointer",fontSize:11,padding:0}}>✕</button>
+                  </div>
+                ))}
               </div>
               <div style={{fontSize:11,color:G.muted,marginTop:4}}>Clique ✕ pour supprimer manuellement</div>
             </div>
-            <div style={{borderTop:`1px solid ${G.border}`,paddingTop:18,display:"flex",flexDirection:"column",gap:12}}>
-              <Tag n="Passe 2">Dédoublonnage intelligent — similarité + volume</Tag>
-              <Info color={G.yellow}>Claude repère les quasi-doublons et garde toujours celui avec le plus grand volume. Batches de 80.</Info>
-              {loading&&loadMsg.includes("Dédoublon")?<Spin msg={loadMsg}/>:<Btn onClick={runClaudeDedup} color={G.yellow}>🤖 Dédoublonner intelligemment</Btn>}
-            </div>
-            <div style={{borderTop:`1px solid ${G.border}`,paddingTop:18,marginTop:4}}>
-              <Tag n="Passe 3">Affinage sémantique — optionnel</Tag>
-              <Info color={G.muted}>Claude supprime les mots-clés hors-périmètre restants. Batches de 80.</Info>
-              {loading&&loadMsg.includes("sémantique")?<Spin msg={loadMsg}/>:<Btn secondary onClick={runClaudeSemanticPass}>🤖 Affinage sémantique (optionnel)</Btn>}
-            </div>
           </>}
+
           <div style={{display:"flex",justifyContent:"space-between",marginTop:24}}>
             <Btn secondary onClick={()=>nav(3)}>← Retour</Btn>
             <Btn onClick={()=>nav(5)} disabled={cleanedKws.length===0}>Catégorisation →</Btn>
@@ -659,7 +836,7 @@ export default function App(){
 
         {step===5&&<Card>
           <H2 c="🏷 Catégorisation"/>
-          <Sub c="Catégorie produit + grande catégorie SEB. Traitement par lots de 80."/>
+          <Sub c="Catégorisation tôt — avant le dédoublonnage — pour préserver la diversité sémantique par catégorie."/>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:16}}>
             <div><div style={{fontSize:11,color:G.muted,marginBottom:8,textTransform:"uppercase",letterSpacing:".06em"}}>Catégories site ({categories.length})</div><div style={{display:"flex",flexWrap:"wrap",gap:5}}>{categories.map((c,i)=><span key={i} style={{background:G.accent+"18",border:`1px solid ${G.accent}33`,color:G.accent,padding:"3px 10px",borderRadius:20,fontSize:11}}>{c}</span>)}</div></div>
             <div><div style={{fontSize:11,color:G.muted,marginBottom:8,textTransform:"uppercase",letterSpacing:".06em"}}>Catégories SEB (9)</div><div style={{display:"flex",flexWrap:"wrap",gap:5}}>{SEB_CATS.map((c,i)=><span key={i} style={{background:G.green+"18",border:`1px solid ${G.green}33`,color:G.green,padding:"3px 10px",borderRadius:20,fontSize:11}}>{c}</span>)}</div></div>
@@ -669,41 +846,129 @@ export default function App(){
         </Card>}
 
         {step===6&&<Card>
-          <H2 c="✅ Sélection finale + Export"/>
-          <Sub c="Choisis ta cible — l'app répartit proportionnellement par catégorie en conservant le ratio naturel."/>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:20}}>
-            <Stat value={allSourceKws().length} label="Sources" color={G.muted}/>
-            <Stat value={rawWithVol.length} label="Avec volumes" color={G.yellow}/>
-            <Stat value={cleanedKws.length} label="Après nettoyage" color={G.accent}/>
-            <Stat value={categorizedKws.length} label="Catégorisés" color={G.green}/>
+          <H2 c="🔬 Dédoublonnage par catégorie + Sélection"/>
+          <Sub c="Maintenant que chaque mot-clé est catégorisé, on dédoublonne au sein de chaque catégorie en préservant la diversité sémantique. Puis on choisit le nombre final avec un plancher garanti par catégorie."/>
+
+          {/* Stats */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:16}}>
+            <Stat value={categorizedKws.length} label="Après catégorisation" color={G.yellow}/>
+            <Stat value={dedupStats?.afterDedup??categorizedKws.length} label="Après dédup" color={G.accent}/>
+            <Stat value={dedupStats?.similarPairs?.length??0} label="Paires similaires" color={dedupStats?.similarPairs?.length>0?G.yellow:G.green}/>
           </div>
-          {categorizedKws.length>0&&(()=>{
-            const balanced=buildBalancedList(categorizedKws,targetCount);
+
+          {/* Similarity alert */}
+          {dedupStats?.similarPairs?.length>0&&!dedupStats?.afterDedup&&<div style={{background:G.yellow+"14",border:`1px solid ${G.yellow}44`,borderRadius:8,padding:"12px 14px",marginBottom:14}}>
+            <div style={{fontSize:12,color:G.yellow,fontWeight:600,marginBottom:8}}>⚠ {dedupStats.similarPairs.length} paires potentiellement similaires détectées (cross-catégories)</div>
+            <div style={{maxHeight:120,overflowY:"auto",background:G.faint,borderRadius:6,padding:"6px 10px",fontSize:11}}>
+              {dedupStats.similarPairs.slice(0,15).map((p,i)=>(
+                <div key={i} style={{display:"grid",gridTemplateColumns:"1fr 24px 1fr 36px",gap:4,padding:"2px 0",borderBottom:`1px solid ${G.border}`}}>
+                  <span style={{color:G.sub}}>{p.a.keyword} <span style={{color:G.muted,fontSize:10}}>({p.a.volume})</span></span>
+                  <span style={{color:G.muted,textAlign:"center"}}>↔</span>
+                  <span style={{color:G.sub}}>{p.b.keyword} <span style={{color:G.muted,fontSize:10}}>({p.b.volume})</span></span>
+                  <span style={{color:G.yellow,textAlign:"right"}}>{p.score}%</span>
+                </div>
+              ))}
+              {dedupStats.similarPairs.length>15&&<div style={{color:G.muted,padding:"3px 0",fontSize:10}}>… {dedupStats.similarPairs.length-15} autres</div>}
+            </div>
+          </div>}
+
+          {/* Dedup by category */}
+          <div style={{background:G.faint,border:`1px solid ${G.border}`,borderRadius:10,padding:16,marginBottom:16}}>
+            <div style={{fontSize:13,color:G.text,fontWeight:600,marginBottom:8}}>🔬 Dédoublonnage par catégorie</div>
+            <Info color={G.accent}>Claude analyse chaque catégorie séparément et supprime les quasi-doublons (pluriel, accent, faute) en gardant le meilleur volume. La diversité sémantique est préservée — deux mots d'intention différente ne sont jamais fusionnés.</Info>
+            {loading&&loadMsg.includes("Dédup")?<Spin msg={loadMsg}/>:
+              dedupStats?.afterDedup
+                ?<div style={{background:G.green+"14",border:`1px solid ${G.green}44`,borderRadius:7,padding:"10px 14px",fontSize:12,color:G.green}}>✅ Dédup terminé : {dedupStats.afterDedup} mots-clés ({dedupStats.dedupRemoved} supprimés){dedupStats.similarPairs?.length>0&&<span style={{color:G.yellow}}> · {dedupStats.similarPairs.length} paires similaires restantes</span>}</div>
+                :<Btn onClick={runDedupByCategory} color={G.accent}>🤖 Dédoublonner par catégorie</Btn>
+            }
+          </div>
+
+          {/* Target count + min per category */}
+          {(()=>{
+            const source=dedupedKws.length>0?dedupedKws:categorizedKws;
+            const balanced=buildBalancedList(source,targetCount,minPerCat);
             const groups={};for(const k of balanced)groups[k.category]=(groups[k.category]||0)+1;
             return <>
-              <div style={{background:G.faint,border:`1px solid ${G.border}`,borderRadius:10,padding:20,marginBottom:20}}>
-                <div style={{fontSize:13,color:G.text,fontWeight:600,marginBottom:14}}>🎯 Taille de la liste finale</div>
-                <div style={{display:"flex",alignItems:"center",gap:16,marginBottom:12}}>
-                  <input type="range" min={50} max={Math.min(2000,categorizedKws.length)} step={50} value={targetCount} onChange={e=>setTargetCount(Number(e.target.value))} style={{flex:1,accentColor:G.accent}}/>
-                  <div style={{fontSize:24,fontWeight:700,color:G.accent,fontFamily:"'Space Grotesk',sans-serif",minWidth:60,textAlign:"right"}}>{targetCount}</div>
+              <div style={{background:G.faint,border:`1px solid ${G.border}`,borderRadius:10,padding:18,marginBottom:14}}>
+                <div style={{fontSize:13,color:G.text,fontWeight:600,marginBottom:14}}>🎯 Sélection finale</div>
+                <div style={{display:"flex",alignItems:"center",gap:16,marginBottom:8}}>
+                  <span style={{fontSize:11,color:G.muted,flexShrink:0}}>Total cible</span>
+                  <input type="range" min={50} max={Math.min(2000,source.length)} step={50} value={targetCount}
+                    onChange={e=>setTargetCount(Number(e.target.value))} style={{flex:1,accentColor:G.accent}}/>
+                  <div style={{fontSize:22,fontWeight:700,color:G.accent,fontFamily:"'Space Grotesk',sans-serif",minWidth:55,textAlign:"right"}}>{targetCount}</div>
                 </div>
-                <div style={{fontSize:12,color:G.sub,marginBottom:10}}><strong style={{color:G.text}}>{Object.keys(groups).length} catégories</strong> · ratio naturel · meilleurs volumes</div>
-                <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:16}}>{Object.entries(groups).sort((a,b)=>b[1]-a[1]).map(([cat,n])=><span key={cat} style={{fontSize:11,background:G.accent+"18",border:`1px solid ${G.accent}33`,color:G.accent,padding:"2px 8px",borderRadius:12}}>{cat} <strong>{n}</strong></span>)}</div>
-                <Btn onClick={()=>{try{dlCSV([["Main SEB Category","Keyword","Avg. Monthly Volume","Product Category"],...balanced.map(k=>[k.sebCategory||"",k.keyword,k.volume,k.category||""])],`${config.brand}_${config.country}_keywords_${targetCount}.csv`);setTimeout(()=>addLog(`📥 ${balanced.length} mots-clés exportés`),0);}catch(e){setErr("Erreur export: "+e.message);}}}>📥 Télécharger — {targetCount} mots-clés</Btn>
+                <div style={{display:"flex",alignItems:"center",gap:16,marginBottom:12}}>
+                  <span style={{fontSize:11,color:G.muted,flexShrink:0}}>Min. par catégorie</span>
+                  <input type="range" min={1} max={20} step={1} value={minPerCat}
+                    onChange={e=>setMinPerCat(Number(e.target.value))} style={{flex:1,accentColor:G.yellow}}/>
+                  <div style={{fontSize:16,fontWeight:700,color:G.yellow,fontFamily:"'Space Grotesk',sans-serif",minWidth:55,textAlign:"right"}}>{minPerCat} min</div>
+                </div>
+                <div style={{fontSize:11,color:G.muted,marginBottom:12}}>Chaque catégorie aura au minimum {minPerCat} mots-clés, même si elle est sous-représentée.</div>
+                <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:14}}>
+                  {Object.entries(groups).sort((a,b)=>b[1]-a[1]).map(([cat,n])=>(
+                    <span key={cat} style={{fontSize:11,background:G.accent+"18",border:`1px solid ${G.accent}33`,color:G.accent,padding:"2px 8px",borderRadius:12}}>{cat} <strong>{n}</strong></span>
+                  ))}
+                </div>
               </div>
-              <div style={{maxHeight:200,overflowY:"auto",fontSize:12}}>
-                <div style={{display:"grid",gridTemplateColumns:"140px 1fr 70px 130px",position:"sticky",top:0,background:G.card,paddingBottom:5}}>{["SEB Cat.","Mot-clé","Volume","Catégorie"].map(h=><div key={h} style={{color:G.muted,fontSize:10,textTransform:"uppercase",letterSpacing:".06em",padding:"4px 6px"}}>{h}</div>)}</div>
-                {balanced.slice(0,20).map((k,i)=><div key={i} style={{display:"grid",gridTemplateColumns:"140px 1fr 70px 130px",background:i%2===0?G.faint:"transparent",borderRadius:4}}>
-                  <div style={{padding:"5px 6px",fontSize:11,color:"#7ab3ff"}}>{k.sebCategory}</div>
-                  <div style={{padding:"5px 6px",color:G.text}}>{k.keyword}</div>
-                  <div style={{padding:"5px 6px",color:G.accent}}>{k.volume>0?k.volume.toLocaleString():"—"}</div>
-                  <div style={{padding:"5px 6px",color:G.sub,fontSize:11}}>{k.category}</div>
-                </div>)}
-                {balanced.length>20&&<div style={{color:G.muted,padding:"6px",fontSize:11}}>… {balanced.length-20} dans l'export</div>}
+              <div style={{display:"flex",justifyContent:"space-between",marginTop:8}}>
+                <Btn secondary onClick={()=>nav(5)}>← Retour</Btn>
+                <Btn onClick={()=>nav(7)}>Voir l'export → ({balanced.length} mots-clés)</Btn>
               </div>
             </>;
           })()}
-          <div style={{display:"flex",justifyContent:"flex-start",marginTop:20}}><Btn secondary onClick={()=>nav(5)}>← Retour</Btn></div>
+        </Card>}
+
+        {step===7&&<Card>
+          <H2 c="✅ Export final"/>
+          <Sub c="Liste finale équilibrée — ratio naturel respecté, minimum garanti par catégorie."/>
+          {(()=>{
+            const source=dedupedKws.length>0?dedupedKws:categorizedKws;
+            const balanced=buildBalancedList(source,targetCount,minPerCat);
+            const groups={};for(const k of balanced)groups[k.category]=(groups[k.category]||0)+1;
+            const needsTranslation=!["fr","français","french","en","english","anglais"].some(l=>config.language.toLowerCase().includes(l));
+            return <>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:16}}>
+                <Stat value={allSourceKws().length} label="Sources" color={G.muted}/>
+                <Stat value={cleanedKws.length} label="Après nettoyage" color={G.yellow}/>
+                <Stat value={source.length} label="Après dédup" color={G.accent}/>
+                <Stat value={balanced.length} label="Export final" color={G.green}/>
+              </div>
+              <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:16}}>
+                {Object.entries(groups).sort((a,b)=>b[1]-a[1]).map(([cat,n])=>(
+                  <span key={cat} style={{fontSize:11,background:G.accent+"18",border:`1px solid ${G.accent}33`,color:G.accent,padding:"2px 8px",borderRadius:12}}>{cat} <strong>{n}</strong></span>
+                ))}
+              </div>
+              <div style={{maxHeight:200,overflowY:"auto",fontSize:12,marginBottom:16}}>
+                {(()=>{
+                  const cols=needsTranslation?"140px 1fr 70px 120px 100px":"140px 1fr 70px 130px";
+                  return<>
+                  <div style={{display:"grid",gridTemplateColumns:cols,position:"sticky",top:0,background:G.card,paddingBottom:5}}>
+                    {["SEB Cat.","Mot-clé","Volume","Catégorie",...(needsTranslation?["EN"]:[])].map(h=><div key={h} style={{color:G.muted,fontSize:10,textTransform:"uppercase",letterSpacing:".06em",padding:"4px 6px"}}>{h}</div>)}
+                  </div>
+                  {balanced.slice(0,20).map((k,i)=><div key={i} style={{display:"grid",gridTemplateColumns:cols,background:i%2===0?G.faint:"transparent",borderRadius:4}}>
+                    <div style={{padding:"5px 6px",fontSize:11,color:"#7ab3ff"}}>{k.sebCategory}</div>
+                    <div style={{padding:"5px 6px",color:G.text}}>{k.keyword}</div>
+                    <div style={{padding:"5px 6px",color:G.accent}}>{k.volume>0?k.volume.toLocaleString():"—"}</div>
+                    <div style={{padding:"5px 6px",color:G.sub,fontSize:11}}>{k.category}</div>
+                    {needsTranslation&&<div style={{padding:"5px 6px",color:G.muted,fontSize:11}}>{k.translation||""}</div>}
+                  </div>)}
+                  {balanced.length>20&&<div style={{color:G.muted,padding:"6px",fontSize:11}}>… {balanced.length-20} dans l'export</div>}
+                  </>;
+                })()}
+              </div>
+              <div style={{display:"flex",gap:12,justifyContent:"space-between"}}>
+                <Btn secondary onClick={()=>nav(6)}>← Retour</Btn>
+                <Btn onClick={()=>{
+                  try{
+                    const headers=["Main SEB Category","Keyword","Avg. Monthly Volume","Product Category"];
+                    if(needsTranslation)headers.push("English Translation");
+                    dlCSV([headers,...balanced.map(k=>{const row=[k.sebCategory||"",k.keyword,k.volume,k.category||""];if(needsTranslation)row.push(k.translation||"");return row;})],`${config.brand}_${config.country}_keywords_${balanced.length}.csv`);
+                    setTimeout(()=>addLog(`📥 ${balanced.length} mots-clés exportés${needsTranslation?" (+ traductions EN)":""}`),0);
+                  }catch(e){setErr("Erreur export: "+e.message);}
+                }}>📥 Télécharger — {balanced.length} mots-clés</Btn>
+              </div>
+            </>;
+          })()}
         </Card>}
 
         {log.length>0&&<div style={{marginTop:24}}>
